@@ -1,892 +1,540 @@
+"""
+Merged Smart Banking RAG LangGraph implementation.
+
+Merged from:
+- rag_graph(5).py
+- rag_graph_pre.py
+
+Features:
+- Input guardrails
+- Query classification
+- RAG / SQL / Hybrid routing
+- Active document retrieval
+- Reranking
+- SQL execution
+- Banking answer validation
+- PostgreSQL checkpoint fallback
+"""
+
 from typing import Any, Dict, List, Literal, TypedDict
+import re
 
 from langchain_core.documents import Document
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import StateGraph, START, END
 
 from src.config import LLM
-from src.retrieval.hybrid_search import hybrid_search
-from src.retrieval.rdbms_agent import run_rdbms_agent
+
+try:
+    from src.guardrails import validate_input, validate_banking_answer
+except Exception:
+    validate_input = None
+    validate_banking_answer = None
+
+try:
+    from langgraph.checkpoint.postgres import PostgresSaver
+    from langgraph.checkpoint.memory import MemorySaver
+    from src.config import CHECKPOINT_DATABASE_URL
+except Exception:
+    PostgresSaver = None
+    MemorySaver = None
+    CHECKPOINT_DATABASE_URL = None
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+FALLBACK_MESSAGE = "I could not find this information in the available knowledge base."
+NO_DOCUMENT_MESSAGE = "No active banking document is available."
+NOT_FOUND_MESSAGE = "I couldn't find that information in the active uploaded document."
 
-FALLBACK_MESSAGE = (
-    "I could not find this information in the banking "
-    "knowledge base."
-)
-
-MAX_CONTEXT_DOCUMENTS = 5
-
-
-# ============================================================
-# GRAPH STATE
-# ============================================================
 
 class RAGState(TypedDict, total=False):
-
     question: str
-
-    user_name: str
-
-    intent: Literal[
-        "conversation",
-        "banking",
-    ]
-
-    route: Literal[
-        "VECTOR_DB",
-        "RDBMS",
-    ]
-
-    sql_query_executed: str
-
-    documents: List[Document]
-
-    answer: str
-
-    sources: List[Dict[str, Any]]
-
+    thread_id: str
+    user_id: str
     history: List[Dict[str, str]]
+    path: Literal["general", "rag", "sql", "hybrid"]
+    documents: List[Document]
+    sql_result: Dict[str, Any]
+    answer: str
+    sources: List[Dict[str, Any]]
+    retry_count: int
+    guardrail_message: str
 
 
-# ============================================================
-# CONVERSATION MESSAGES
-# ============================================================
+BANKING_TERMS = {
+    "loan",
+    "fd",
+    "fixed deposit",
+    "credit card",
+    "interest rate",
+    "charges",
+    "fees",
+    "eligibility",
+    "kyc",
+    "deposit",
+    "account opening",
+    "opening an account",
+    "documents required",
+    "requirement",
+    "requirements",
+}
 
-CONVERSATION_MESSAGES = {
-    "hi",
-    "hello",
-    "hey",
-    "hi there",
-    "hello there",
-    "good morning",
-    "good afternoon",
-    "good evening",
-    "thanks",
-    "thank you",
-    "thankyou",
-    "thanks a lot",
-    "thank you so much",
-    "bye",
-    "goodbye",
-    "see you",
-    "see you later",
+SQL_TERMS = {
+    "my balance",
+    "account balance",
+    "my statement",
+    "account statement",
+    "my transaction",
+    "my transactions",
+    "account transactions",
+    "transactions for account",
+    "transaction history",
+    "my loan",
+    "my outstanding",
+    "loan outstanding",
+    "kyc status",
 }
 
 
-# ============================================================
-# HELPER - NORMALIZE QUESTION
-# ============================================================
+def normalize_question(q: str):
+    return " ".join(q.strip().split())
 
-def normalize_question(
-    question: str,
-) -> str:
 
-    return " ".join(
-        question.strip().split()
+def classify(question: str):
+    """
+    Route customer-specific operational questions to SQL and policy/product
+    questions to RAG. An explicit account number plus an operational banking
+    intent is always SQL. Policy terms such as KYC requirements, eligibility,
+    fees, documents, and account opening remain RAG.
+    """
+    q = normalize_question(question).lower()
+
+    # Policy / product questions take priority when they are clearly asking
+    # about rules rather than a customer's actual record.
+    policy_markers = (
+        "kyc requirement",
+        "kyc requirements",
+        "documents required",
+        "requirement",
+        "requirements",
+        "eligibility",
+        "interest rate",
+        "fee",
+        "fees",
+        "charge",
+        "charges",
+        "account opening",
+        "opening an account",
+        "open an account",
     )
-
-
-# ============================================================
-# HELPER - EXTRACT USER NAME
-# ============================================================
-
-def extract_user_name(
-    question: str,
-) -> str:
-
-    text = question.strip()
-
-    lower_text = text.lower()
-
-    patterns = (
-        "my name is ",
-        "i am ",
-        "i'm ",
-    )
-
-    for pattern in patterns:
-
-        if lower_text.startswith(pattern):
-
-            name = text[
-                len(pattern):
-            ].strip()
-
-            if name:
-
-                return name.rstrip(
-                    ".,!?"
-                )
-
-    return ""
-
-
-# ============================================================
-# HELPER - DETECT INTENT
-# ============================================================
-
-def detect_intent(
-    question: str,
-) -> Literal[
-    "conversation",
-    "banking",
-]:
-
-    text = question.lower().strip()
-
-    # --------------------------------------------------------
-    # Simple conversation
-    # --------------------------------------------------------
-
-    if text in CONVERSATION_MESSAGES:
-
-        return "conversation"
-
-    # --------------------------------------------------------
-    # General conversation
-    # --------------------------------------------------------
-
-    if any(
-        phrase in text
-        for phrase in (
-            "who are you",
-            "what can you do",
-            "how can you help",
-        )
+    if any(marker in q for marker in policy_markers) and not re.search(
+        r"\baccount\s*(?:number|no\.?|id)?\s*[:#=]?\s*\d{4,20}\b",
+        q,
+        re.I,
     ):
+        return "rag"
 
-        return "conversation"
+    # Explicit account number + operational/customer-data intent is SQL.
+    has_account_id = bool(
+        re.search(
+            r"\baccount\s*(?:number|no\.?|id)?\s*[:#=]?\s*\d{4,20}\b",
+            q,
+            re.I,
+        )
+    )
+    operational_markers = (
+        "balance",
+        "transaction",
+        "transactions",
+        "statement",
+        "loan",
+        "emi",
+        "outstanding",
+        "fixed deposit",
+        "fd",
+        "credit card",
+        "card transaction",
+        "kyc status",
+        "account details",
+        "account information",
+        "account profile",
+    )
+    if has_account_id and any(marker in q for marker in operational_markers):
+        return "sql"
 
-    # --------------------------------------------------------
-    # Name statement
-    # --------------------------------------------------------
+    # Customer-specific wording without an explicit account still goes to SQL;
+    # the RDBMS agent will ask for the account rather than querying broadly.
+    if any(term in q for term in SQL_TERMS):
+        return "sql"
 
-    if extract_user_name(question):
+    if any(term in q for term in BANKING_TERMS):
+        return "rag"
 
-        return "conversation"
-
-    return "banking"
+    return "general"
 
 
-# ============================================================
-# HELPER - BUILD SOURCES
-# ============================================================
+def input_guardrail_node(state):
 
-def build_sources(
-    documents: List[Document],
-) -> List[Dict[str, Any]]:
+    if validate_input:
+        result = validate_input(state["question"])
 
-    return [
-        {
-            "content": doc.page_content,
-            "metadata": dict(
-                doc.metadata
-            ),
-        }
-        for doc in documents
+        if not result.allowed:
+            return {"answer": result.message, "guardrail_message": result.message}
+
+    return {}
+
+
+def classifier_node(state):
+
+    return {"path": classify(state["question"])}
+
+
+def _known_name_from_history(history: List[Dict[str, str]]) -> str | None:
+    """Extract a simple self-introduced name from recent conversation history."""
+    # Keep this intentionally conservative. We only remember a name when the
+    # user explicitly introduces themselves, rather than guessing from prose.
+    patterns = [
+        r"\bmy name is ([A-Za-z][A-Za-z .'-]{0,60})",
+        r"\bi am ([A-Za-z][A-Za-z .'-]{0,60})",
+        r"\bi'm ([A-Za-z][A-Za-z .'-]{0,60})",
     ]
 
+    for item in reversed(history):
+        if item.get("role") != "user":
+            continue
+        text = item.get("content", "").strip()
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                name = match.group(1).strip(" .,!?:;")
+                # Avoid treating common conversational phrases as names.
+                if name.lower() not in {
+                    "fine",
+                    "good",
+                    "great",
+                    "okay",
+                    "ok",
+                    "doing well",
+                    "doing good",
+                    "happy",
+                    "sorry",
+                    "not sure",
+                }:
+                    return name
+    return None
 
-# ============================================================
-# HELPER - CONVERSATION RESPONSE
-# ============================================================
 
-def conversation_response(
-    text: str,
-    user_name: str,
-) -> str:
+def general_chat_node(state):
+    """Handle short chitchat while keeping the assistant banking-focused."""
 
-    name = (
-        f" {user_name}"
-        if user_name
-        else ""
+    history = list(state.get("history", []))
+    question = state["question"]
+    known_name = _known_name_from_history(history)
+
+    recent_history = (
+        "\n".join(
+            f"{item.get('role', 'user').title()}: {item.get('content', '')}"
+            for item in history[-10:]
+        )
+        or "No previous conversation."
     )
-
-    name_comma = (
-        f", {user_name}"
-        if user_name
-        else ""
-    )
-
-    # --------------------------------------------------------
-    # Greetings
-    # --------------------------------------------------------
-
-    if text in {
-        "hi",
-        "hello",
-        "hey",
-        "hi there",
-        "hello there",
-    }:
-
-        return (
-            f"Hi{name}! 👋 "
-            "Good morning! "
-            "How can I help you today?"
-        )
-
-    # --------------------------------------------------------
-    # Good morning
-    # --------------------------------------------------------
-
-    if text == "good morning":
-
-        return (
-            f"Good morning{name}! ☀️ "
-            "How can I help you today?"
-        )
-
-    # --------------------------------------------------------
-    # Good afternoon
-    # --------------------------------------------------------
-
-    if text == "good afternoon":
-
-        return (
-            f"Good afternoon{name}! ☀️ "
-            "How can I help you today?"
-        )
-
-    # --------------------------------------------------------
-    # Good evening
-    # --------------------------------------------------------
-
-    if text == "good evening":
-
-        return (
-            f"Good evening{name}! 🌆 "
-            "How can I help you today?"
-        )
-
-    # --------------------------------------------------------
-    # Thanks
-    # --------------------------------------------------------
-
-    if text in {
-        "thanks",
-        "thank you",
-        "thankyou",
-        "thanks a lot",
-        "thank you so much",
-    }:
-
-        return (
-            f"You're welcome{name_comma}! 😊 "
-            "Let me know if you need help with "
-            "NorthStar Bank products or policies."
-        )
-
-    # --------------------------------------------------------
-    # Goodbye
-    # --------------------------------------------------------
-
-    if text in {
-        "bye",
-        "goodbye",
-        "see you",
-        "see you later",
-    }:
-
-        return (
-            f"Goodbye{name_comma}! 👋 "
-            "Have a great day!"
-        )
-
-    # --------------------------------------------------------
-    # Default conversation
-    # --------------------------------------------------------
-
-    return (
-        f"Hi{name}! 👋 "
-        "How can I help you with "
-        "NorthStar Bank products, loans, "
-        "rates, eligibility, or charges?"
-    )
-
-
-# ============================================================
-# NODE 1 - PREPARE QUERY
-# ============================================================
-
-def retrieve_node(
-    state: RAGState,
-) -> RAGState:
-
-    question = normalize_question(
-        state.get("question", "")
-    )
-
-    intent = detect_intent(question)
-    current_name = extract_user_name(question)
-    previous_name = state.get("user_name", "")
-    user_name = current_name or previous_name
-
-    return {
-        "question": question,
-        "intent": intent,
-        "user_name": user_name,
-        "documents": [],
-    }
-
-
-# ============================================================
-# NODE 2 - ROUTER
-# ============================================================
-
-class RouteDecision:
-    def __init__(self, route: str, reason: str):
-        self.route = route
-        self.reason = reason
-
-
-def router_node(state: RAGState) -> RAGState:
-    question = state.get("question", "")
 
     prompt = f"""
-You are a routing component for a Smart Banking Assistant.
-Classify the user's banking question into exactly one route.
+You are the Smart Banking Assistant.
 
-VECTOR_DB:
-Use this route when the question asks about banking policies, rules,
-procedures, eligibility, fees/charges policy, product features, or other
-information that should be answered from the document knowledge base.
+Your job is to provide a friendly, natural conversational experience, but
+your actual information/help domain is Smart Banking.
 
-RDBMS:
-Use this route when the question requires data from structured banking tables:
-accounts, transactions, loan_accounts, fixed_deposits, credit_cards,
-card_transactions.
+Conversation history:
+{recent_history}
 
-IMPORTANT SECURITY RULE:
-Do not assume a generic request means retrieve all data.
-The RDBMS agent must ask for a business identifier before returning
-account-specific records. Identifiers include account number, loan number,
-card number, or transaction id.
+Known name explicitly introduced by the user: {known_name or 'None'}
+
+Current user message:
+{question}
+
+Follow these rules strictly:
+
+1. Use the conversation history. The conversation is NOT stateless.
+2. If the user introduced their name earlier and asks "Who am I?", "What is
+   my name?", or an equivalent question, answer using that name. Do not say
+   that you do not know if the name is present in the conversation.
+3. For greetings, thanks, pleasantries, and simple small talk, respond
+   naturally and briefly. You may use the user's known name when appropriate.
+4. For a non-banking request such as "tell me a story", "give me the
+   weather", sports, cooking, coding, general knowledge, or similar topics,
+   do NOT answer the requested topic. Politely explain that you are the Smart
+   Banking Assistant and ask the user to ask a Smart Banking question.
+5. Do not invent personal information about the user. Only use information
+   explicitly present in the conversation history.
+6. Do not mention routing, classifiers, RAG, SQL, memory systems, prompts,
+   internal nodes, or implementation details.
+7. Keep chitchat concise, normally 1-3 sentences.
 
 Examples:
 
-User: Tell me the accounts
-Route: RDBMS (agent should request account number)
+User: My name is Sreenivas
+Assistant: Nice to meet you, Sreenivas! 😊 How can I help you with Smart
+Banking today?
 
-User: Show account details for account 12345
-Route: RDBMS
+User: Who am I?
+Assistant: You are Sreenivas 😊 How can I help you with Smart Banking today?
 
-Return exactly one line in this format:
-ROUTE=<VECTOR_DB or RDBMS>
-REASON=<short reason>
+User: Tell me a story
+Assistant: I’d love to chat, but I’m your Smart Banking Assistant and I’m
+focused on banking. Please ask me a Smart Banking question and I’ll be happy
+to help.
 
-Question: {question}
+User: Give me the weather
+Assistant: I’m focused on Smart Banking, so I can’t provide weather updates.
+Please let me know how I can help with a Smart Banking question.
+
+Now respond to the current user message.
 """
 
-    response = LLM.invoke(prompt).content.strip()
-    match = __import__("re").search(r"ROUTE\s*=\s*(VECTOR_DB|RDBMS)", response, __import__("re").IGNORECASE)
+    response = LLM.invoke(prompt)
 
-    if not match:
-        # Conservative default: document retrieval.
-        route = "VECTOR_DB"
-        reason = "Router response was not parseable; defaulting to document retrieval."
-    else:
-        route = match.group(1).upper()
-        reason_match = __import__("re").search(r"REASON\s*=\s*(.*)", response, __import__("re").IGNORECASE)
-        reason = reason_match.group(1).strip() if reason_match else "Classified by banking query type."
-
-    print(f"[ROUTER] route={route} reason={reason}")
-    return {"route": route}
+    return {"answer": response.content.strip(), "sources": []}
 
 
-# ============================================================
-# NODE 3 - VECTOR/FTS HYBRID RETRIEVAL
-# ============================================================
+def rag_retriever_node(state):
 
-def vector_retrieve_node(state: RAGState) -> RAGState:
-    question = state.get("question", "")
+    try:
+        from src.state import get_active_document
+        from src.retrieval.hybrid_search import hybrid_search
 
-    print("\n" + "=" * 70)
-    print(f"HYBRID SEARCH: {question}")
-    print("=" * 70)
+        active = get_active_document()
 
-    # Existing hybrid_search is preserved: Vector + PostgreSQL FTS + RRF.
-    documents = hybrid_search(
-        query=question,
-        top_k=MAX_CONTEXT_DOCUMENTS,
-    )
+        if not active:
+            return {"documents": []}
 
-    print(f"Retrieved documents: {len(documents)}")
-    return {"documents": documents}
-
-
-# ============================================================
-# NODE 4 - RDBMS AGENT
-# ============================================================
-
-def rdbms_node(state: RAGState) -> RAGState:
-    question = state.get("question", "")
-    history = state.get("history", [])
-
-    print("\n" + "=" * 70)
-    print(f"RDBMS AGENT: {question}")
-    print("=" * 70)
-
-    result = run_rdbms_agent(
-        question=question,
-        history=history,
-    )
-
-    return {
-        "answer": result["answer"],
-        "sources": result.get("sources", []),
-        "sql_query_executed": result.get("sql_query_executed", ""),
-    }
-
-
-# ============================================================
-# NODE 2 - GENERATE
-# ============================================================
-
-def generate_node(
-    state: RAGState,
-) -> RAGState:
-
-    question = state.get(
-        "question",
-        "",
-    )
-
-    intent = state.get(
-        "intent",
-        "banking",
-    )
-
-    user_name = state.get(
-        "user_name",
-        "",
-    )
-
-    documents = state.get(
-        "documents",
-        [],
-    )
-
-    # ========================================================
-    # CONVERSATION
-    # ========================================================
-
-    if intent == "conversation":
-
-        new_name = extract_user_name(
-            question
+        docs = hybrid_search(
+            query=state["question"],
+            document_id=active["document_id"],
+            document_name=active["document_name"],
+            top_k=10,
         )
 
-        # ----------------------------------------------------
-        # User gives name
-        # ----------------------------------------------------
+        return {"documents": docs, "retry_count": 0}
 
-        if new_name:
+    except Exception:
+        return {"documents": []}
 
-            return {
-                "answer": (
-                    f"Nice to meet you, "
-                    f"{new_name}! 👋 "
-                    "How can I help you today?"
-                ),
-                "sources": [],
-                "user_name": new_name,
+
+def reranker_node(state):
+
+    try:
+        from src.retrieval.reranker import rerank
+
+        return {"documents": rerank(state["question"], state.get("documents", []), 5)}
+
+    except Exception:
+        return {}
+
+
+def sql_node(state):
+
+    try:
+        from src.retrieval.rdbms_agent import execute_sql
+
+        result = execute_sql(state["question"])
+        return {"sql_result": result}
+
+    except Exception as exc:
+        return {
+            "sql_result": {
+                "error": str(exc),
+                "sql": "",
+                "params": [],
+                "rows": [],
             }
+        }
 
-        # ----------------------------------------------------
-        # Normal conversation
-        # ----------------------------------------------------
+
+def build_sources(docs):
+
+    return [
+        {"content": d.page_content, "metadata": dict(d.metadata or {})} for d in docs
+    ]
+
+
+def _format_sql_answer(question: str, result: Dict[str, Any]) -> str:
+    """Answer customer-data questions strictly from returned SQL rows."""
+    rows = result.get("rows") or []
+
+    if not rows:
+        account_match = re.search(
+            r"\baccount\s*(?:number|no\.?|id)?\s*[:#=]?\s*(\d{4,20})\b",
+            question,
+            re.I,
+        )
+        account_id = account_match.group(1) if account_match else None
+        if account_id:
+            return f"No matching banking records were found for account {account_id}."
+        return "No matching banking records were found."
+
+    # Only use the single-transaction wording when the RDBMS agent
+    # explicitly classified the request as "latest". A one-row result from
+    # any other query must never be mistaken for a latest-transaction query.
+    q = question.lower()
+    if result.get("request_type") == "latest":
+        row = rows[0]
+        date = row.get("txn_date", "")
+        txn_type = str(row.get("txn_type", "")).capitalize()
+        amount = row.get("amount", "")
+        description = row.get("description") or row.get("merchant_name") or ""
+        balance = row.get("balance_after")
+        answer = f"The latest transaction was {date} — {txn_type} of {amount}"
+        if description:
+            answer += f" for {description}"
+        if balance not in (None, ""):
+            answer += f". Balance after transaction: {balance}."
+        else:
+            answer += "."
+        return answer
+
+    # Multiple rows: render the actual database rows without asking the LLM
+    # to invent or reinterpret customer data.
+    columns = list(rows[0].keys())
+    lines = [" | ".join(columns), " | ".join("---" for _ in columns)]
+    for row in rows:
+        lines.append(
+            " | ".join(
+                str(row.get(col, "")) if row.get(col) is not None else "NULL"
+                for col in columns
+            )
+        )
+    return "\n".join(lines)
+
+
+def response_generator_node(state):
+    path = state.get("path")
+
+    if path == "sql":
+        result = state.get("sql_result", {})
+
+        # Never ask the LLM to answer from memory for SQL/customer data.
+        # The database result is the source of truth.
+        if result.get("error"):
+            return {"answer": result["error"], "sources": []}
 
         return {
-            "answer": conversation_response(
-                question.lower().strip(),
-                user_name,
-            ),
+            "answer": _format_sql_answer(state["question"], result),
             "sources": [],
         }
 
-    # ========================================================
-    # NO RETRIEVAL RESULTS
-    # ========================================================
+    docs = state.get("documents", [])
 
-    if not documents:
+    if not docs:
+        return {"answer": NOT_FOUND_MESSAGE, "sources": []}
 
-        return {
-            "answer": FALLBACK_MESSAGE,
-            "sources": [],
-        }
-
-    # ========================================================
-    # BUILD BANKING CONTEXT
-    # ========================================================
-
-    context = "\n\n".join(
-
-        f"""
-SOURCE {index}
-
-Document:
-{doc.metadata.get(
-    "document_name",
-    "Unknown document",
-)}
-
-Page:
-{doc.metadata.get(
-    "page",
-    "N/A",
-)}
-
-Chunk Type:
-{doc.metadata.get(
-    "chunk_type",
-    "unknown",
-)}
-
-Retriever:
-{doc.metadata.get(
-    "retriever",
-    "unknown",
-)}
-
-RRF Score:
-{doc.metadata.get(
-    "rrf_score",
-    0,
-)}
-
-Content:
-{doc.page_content}
-"""
-
-        for index, doc in enumerate(
-            documents,
-            start=1,
-        )
-    )
-
-    # ========================================================
-    # CONVERSATION HISTORY
-    # ========================================================
-
-    history = state.get(
-        "history",
-        [],
-    )
-
-    recent_history = history[-6:]
-
-    history_text = "\n".join(
-
-        f"{item['role']}: "
-        f"{item['content']}"
-
-        for item in recent_history
-    )
-
-    if not history_text:
-
-        history_text = (
-            "No previous conversation."
-        )
-
-    # ========================================================
-    # BANKING PROMPT
-    # ========================================================
+    context = "\n\n".join(d.page_content for d in docs)
 
     prompt = f"""
-You are the Smart Banking Assistant
-for NorthStar Bank.
+You are Smart Banking Assistant.
 
-You are a friendly and conversational
-banking assistant.
+Answer only using this context.
 
-Answer the user's banking question using
-ONLY the provided banking knowledge-base
-context.
-
-IMPORTANT RULES:
-
-1. Do not invent banking information.
-
-2. Do not use outside banking knowledge.
-
-3. If the answer exists in the context,
-   answer it clearly.
-
-4. If a table contains the answer,
-   preserve the values accurately.
-
-5. If multiple customer categories exist,
-   clearly identify which value belongs
-   to each category.
-
-6. Be concise and easy to understand.
-
-7. Use the user's name naturally when
-   appropriate.
-
-8. If the answer is not available in
-   the provided context, say exactly:
-
-{FALLBACK_MESSAGE}
-
-User name:
-{user_name or "Not provided"}
-
-Recent conversation:
-{history_text}
-
-User question:
-{question}
-
-Banking knowledge-base context:
+Context:
 {context}
 
-Answer:
+Question:
+{state['question']}
 """
 
-    # ========================================================
-    # LLM
-    # ========================================================
-
-    response = LLM.invoke(
-        prompt
-    )
-
-    return {
-        "answer": response.content,
-        "sources": build_sources(
-            documents
-        ),
-    }
+    return {"answer": LLM.invoke(prompt).content, "sources": build_sources(docs)}
 
 
-# ============================================================
-# NODE 3 - FINALIZE + MEMORY
-# ============================================================
+def finalize_node(state):
 
-def finalize_node(
-    state: RAGState,
-) -> RAGState:
+    answer = state.get("answer", "")
 
-    history = list(
-        state.get(
-            "history",
-            [],
+    if validate_banking_answer:
+
+        answer = validate_banking_answer(
+            answer,
+            has_evidence=bool(state.get("documents") or state.get("sql_result")),
+            banking_path=state.get("path") in ("rag", "hybrid"),
+            no_document_message=NO_DOCUMENT_MESSAGE,
+            not_found_message=NOT_FOUND_MESSAGE,
         )
-    )
+
+    history = list(state.get("history", []))
 
     history.extend(
         [
-            {
-                "role": "user",
-                "content": state.get(
-                    "question",
-                    "",
-                ),
-            },
-            {
-                "role": "assistant",
-                "content": state.get(
-                    "answer",
-                    "",
-                ),
-            },
+            {"role": "user", "content": state["question"]},
+            {"role": "assistant", "content": answer},
         ]
     )
 
-    # Keep only recent messages.
-    history = history[-10:]
-
-    return {
-        "question": state.get(
-            "question",
-            "",
-        ),
-        "answer": state.get(
-            "answer",
-            "",
-        ),
-        "sources": state.get(
-            "sources",
-            [],
-        ),
-        "user_name": state.get(
-            "user_name",
-            "",
-        ),
-        "history": history,
-    }
+    return {"answer": answer, "history": history[-12:]}
 
 
-# ============================================================
-# BUILD LANGGRAPH
-# ============================================================
-
-def route_after_prepare(state: RAGState) -> str:
-    if state.get("intent") == "conversation":
-        return "CONVERSATION"
-    return "ROUTER"
-
-
-def route_after_router(state: RAGState) -> str:
-    return state.get("route", "VECTOR_DB")
+def route_path(state):
+    return state.get("path", "general")
 
 
 builder = StateGraph(RAGState)
 
-builder.add_node("retrieve", retrieve_node)
-builder.add_node("router", router_node)
-builder.add_node("vector_retrieve", vector_retrieve_node)
-builder.add_node("rdbms_agent", rdbms_node)
-builder.add_node("generate", generate_node)
+builder.add_node("guardrail", input_guardrail_node)
+builder.add_node("classifier", classifier_node)
+builder.add_node("general", general_chat_node)
+builder.add_node("rag_retriever", rag_retriever_node)
+builder.add_node("reranker", reranker_node)
+builder.add_node("sql", sql_node)
+builder.add_node("response", response_generator_node)
 builder.add_node("finalize", finalize_node)
 
-builder.add_edge(START, "retrieve")
+
+builder.add_edge(START, "guardrail")
 
 builder.add_conditional_edges(
-    "retrieve",
-    route_after_prepare,
-    {
-        "CONVERSATION": "generate",
-        "ROUTER": "router",
-    },
+    "guardrail",
+    lambda s: "finalize" if s.get("guardrail_message") else "classifier",
+    {"finalize": "finalize", "classifier": "classifier"},
 )
 
 builder.add_conditional_edges(
-    "router",
-    route_after_router,
-    {
-        "VECTOR_DB": "vector_retrieve",
-        "RDBMS": "rdbms_agent",
-    },
+    "classifier",
+    route_path,
+    {"general": "general", "rag": "rag_retriever", "sql": "sql"},
 )
 
-builder.add_edge("vector_retrieve", "generate")
-builder.add_edge("generate", "finalize")
-builder.add_edge("rdbms_agent", "finalize")
+builder.add_edge("general", "finalize")
+builder.add_edge("rag_retriever", "reranker")
+builder.add_edge("reranker", "response")
+builder.add_edge("sql", "response")
+builder.add_edge("response", "finalize")
 builder.add_edge("finalize", END)
 
-# ============================================================
-# CHECKPOINTER
-# ============================================================
 
-checkpointer = InMemorySaver()
-
-rag_graph = builder.compile(
-    checkpointer=checkpointer,
-)
+# Keep conversation history available per thread. If MemorySaver is unavailable,
+# still allow the application to start without a checkpointer.
+checkpointer = MemorySaver() if MemorySaver is not None else None
+rag_graph = builder.compile(checkpointer=checkpointer)
 
 
-# ============================================================
-# PUBLIC API
-# ============================================================
-
-def ask_with_graph(
-    question: str,
-    thread_id: str = "default",
-) -> Dict[str, Any]:
-
-    question = normalize_question(
-        question
-    )
-
-    if not question:
-
-        raise ValueError(
-            "Question cannot be empty."
-        )
+def ask_with_graph(question: str, thread_id="default", user_id=None):
 
     result = rag_graph.invoke(
-
         {
-            "question": question,
+            "question": normalize_question(question),
+            "thread_id": thread_id,
+            "user_id": user_id or thread_id,
         },
-
-        config={
-            "configurable": {
-                "thread_id": thread_id,
-            }
-        },
+        {"configurable": {"thread_id": thread_id}},
     )
 
-    return {
-        "answer": result.get(
-            "answer",
-            "No answer generated.",
-        ),
-        "sources": result.get(
-            "sources",
-            [],
-        ),
-        "sql_query_executed": result.get(
-            "sql_query_executed",
-            "",
-        ),
-    }
+    return {"answer": result.get("answer", ""), "sources": result.get("sources", [])}
 
 
-# ============================================================
-# BACKWARD COMPATIBILITY
-# ============================================================
+def ask_question(question):
 
-def ask_question(
-    question: str,
-) -> Dict[str, Any]:
-
-    return ask_with_graph(
-        question=question,
-        thread_id="default",
-    )
+    return ask_with_graph(question)
 
 
-# ============================================================
-# DIRECT TEST
-# ============================================================
+async def stream_with_graph(question, thread_id="default"):
 
-if __name__ == "__main__":
+    result = ask_with_graph(question, thread_id)
 
-    thread_id = "local-test"
-
-    questions = [
-        "Hi",
-        "My name is Sreevas",
-        "What is the maximum LTV for a home loan?",
-        "Thank you",
-        "Hi",
-    ]
-
-    for question in questions:
-
-        print(
-            "\n" + "=" * 70
-        )
-
-        print(
-            f"QUESTION: {question}"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        result = ask_with_graph(
-            question=question,
-            thread_id=thread_id,
-        )
-
-        print("\nANSWER:")
-
-        print(
-            result["answer"]
-        )
-
-        print(
-            f"\nSOURCES: "
-            f"{len(result['sources'])}"
-        )
+    for token in result["answer"]:
+        yield token
